@@ -1,0 +1,264 @@
+name: Build app for Esipher
+
+# Builds the Capacitor WebView wrapper Esipher generated into this repo.
+# Esipher triggers it (Save & build / Rebuild) once it has pushed the
+# signing secrets; you can also re-run it by hand from the Actions tab.
+# It deliberately does NOT run on push, so it never starts before the
+# secrets it needs are in place.
+#
+# The "platforms" dispatch input decides which jobs run:
+#   both    — Android + iOS   (default)
+#   android — Android only    (Esipher's Android tab uses this)
+#   ios     — iOS only        (Esipher's iOS tab uses this)
+#
+# Android job — uploads the "esipher-app" artifact:
+#   - app-debug.apk   — install straight onto a device for testing.
+#   - app-release.aab  — signed; upload to the Google Play Console.
+#   Secrets Esipher set: ESIPHER_KEYSTORE_BASE64, ESIPHER_KEYSTORE_PASSWORD,
+#   ESIPHER_KEY_ALIAS.
+#
+# iOS job — additionally requires the repo variable ESIPHER_IOS_ENABLED
+# to be 'true' (Esipher sets it once iOS signing is configured), so it
+# can never start half-set-up. Uploads the "esipher-app-ios" artifact:
+#   - App.ipa — signed for the App Store; upload to App Store Connect.
+#   Secrets Esipher set: ESIPHER_IOS_P12_BASE64, ESIPHER_IOS_P12_PASSWORD,
+#   ESIPHER_IOS_PROFILE_BASE64, ESIPHER_IOS_PROFILE_NAME,
+#   ESIPHER_APPLE_TEAM_ID. Esipher provisions the distribution
+#   certificate + App Store profile via the App Store Connect API.
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: Which app(s) to build
+        type: choice
+        default: both
+        options:
+          - both
+          - android
+          - ios
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Runs unless the dispatch explicitly asked for iOS only.
+    if: ${{ github.event.inputs.platforms != 'ios' }}
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Add the Android platform
+        run: npx --yes cap add android
+
+      - name: Generate launcher icons and splash screens
+        run: npx --yes capacitor-assets generate --android
+
+      - name: Copy web assets into the Android project
+        run: npx --yes cap sync android
+
+      - name: Restore signing keystore
+        run: |
+          if [ -z "${ESIPHER_KEYSTORE_BASE64}" ]; then
+            echo "::error::ESIPHER_KEYSTORE_BASE64 secret is missing — re-run 'Generate & build app' in Esipher so it can set the signing secrets."
+            exit 1
+          fi
+          echo "${ESIPHER_KEYSTORE_BASE64}" | base64 -d > android/app/release.p12
+        env:
+          ESIPHER_KEYSTORE_BASE64: ${{ secrets.ESIPHER_KEYSTORE_BASE64 }}
+
+      - name: Wire the keystore into Gradle
+        run: |
+          cat >> android/app/build.gradle <<'GRADLE'
+
+          // --- added by Esipher: release signing ---
+          android {
+              signingConfigs {
+                  esipherRelease {
+                      storeFile file("release.p12")
+                      storePassword System.getenv("ESIPHER_KEYSTORE_PASSWORD")
+                      keyAlias System.getenv("ESIPHER_KEY_ALIAS")
+                      keyPassword System.getenv("ESIPHER_KEYSTORE_PASSWORD")
+                      storeType "PKCS12"
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.esipherRelease
+                  }
+              }
+          }
+          GRADLE
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+        working-directory: android
+
+      - name: Build signed release bundle
+        run: ./gradlew --no-daemon bundleRelease
+        working-directory: android
+        env:
+          ESIPHER_KEYSTORE_PASSWORD: ${{ secrets.ESIPHER_KEYSTORE_PASSWORD }}
+          ESIPHER_KEY_ALIAS: ${{ secrets.ESIPHER_KEY_ALIAS }}
+
+      - name: Collect outputs
+        run: |
+          mkdir -p _out
+          cp android/app/build/outputs/apk/debug/app-debug.apk _out/app-debug.apk
+          cp android/app/build/outputs/bundle/release/app-release.aab _out/app-release.aab
+          ls -la _out
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esipher-app
+          path: _out
+          if-no-files-found: error
+
+  build-ios:
+    runs-on: macos-14
+    # Runs when the dispatch didn't ask for Android only AND iOS signing
+    # is configured (Esipher sets ESIPHER_IOS_ENABLED once it has
+    # provisioned the certificate + profile). vars is usable in a
+    # job-level if:; secrets and hashFiles() are not.
+    if: ${{ github.event.inputs.platforms != 'android' && vars.ESIPHER_IOS_ENABLED == 'true' }}
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Add the iOS platform
+        run: npx --yes cap add ios
+
+      - name: Generate launcher icons and splash screens
+        run: npx --yes capacitor-assets generate --ios
+
+      - name: Copy web assets into the iOS project
+        run: npx --yes cap sync ios
+
+      - name: Install CocoaPods
+        run: pod install
+        working-directory: ios/App
+
+      - name: Set up code signing
+        run: |
+          for v in ESIPHER_IOS_P12_BASE64 ESIPHER_IOS_P12_PASSWORD ESIPHER_IOS_PROFILE_BASE64 ESIPHER_IOS_PROFILE_NAME; do
+            if [ -z "$(eval echo \$$v)" ]; then
+              echo "::error::$v secret is missing — re-save the iOS settings in Esipher so it can re-provision signing."
+              exit 1
+            fi
+          done
+
+          KEYCHAIN="$RUNNER_TEMP/esipher-signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+
+          echo "$ESIPHER_IOS_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -P "$ESIPHER_IOS_P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+
+          # Make our keychain searchable alongside the login keychain.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+
+          PROFILES="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILES"
+          echo "$ESIPHER_IOS_PROFILE_BASE64" | base64 --decode > "$PROFILES/esipher.mobileprovision"
+
+          rm -f "$RUNNER_TEMP/dist.p12"
+        env:
+          ESIPHER_IOS_P12_BASE64: ${{ secrets.ESIPHER_IOS_P12_BASE64 }}
+          ESIPHER_IOS_P12_PASSWORD: ${{ secrets.ESIPHER_IOS_P12_PASSWORD }}
+          ESIPHER_IOS_PROFILE_BASE64: ${{ secrets.ESIPHER_IOS_PROFILE_BASE64 }}
+          ESIPHER_IOS_PROFILE_NAME: ${{ secrets.ESIPHER_IOS_PROFILE_NAME }}
+
+      - name: Point the App target at the distribution profile
+        working-directory: ios/App
+        # Manual signing has to be set on the App target only — passing
+        # it on the xcodebuild command line applies it to every target,
+        # including the CocoaPods framework targets, which reject a
+        # provisioning profile.
+        run: |
+          gem install xcodeproj --no-document
+          ruby - "$ESIPHER_APPLE_TEAM_ID" "$ESIPHER_IOS_PROFILE_NAME" <<'RUBY'
+          require "xcodeproj"
+          team, profile = ARGV
+          project = Xcodeproj::Project.open("App.xcodeproj")
+          app = project.targets.find { |t| t.name == "App" } or abort("::error::App target not found in App.xcodeproj")
+          app.build_configurations.each do |c|
+            c.build_settings["CODE_SIGN_STYLE"] = "Manual"
+            c.build_settings["CODE_SIGN_IDENTITY"] = "Apple Distribution"
+            c.build_settings["CODE_SIGN_IDENTITY[sdk=iphoneos*]"] = "Apple Distribution"
+            c.build_settings["DEVELOPMENT_TEAM"] = team
+            c.build_settings["DEVELOPMENT_TEAM[sdk=iphoneos*]"] = team
+            c.build_settings["PROVISIONING_PROFILE_SPECIFIER"] = profile
+            c.build_settings["PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]"] = profile
+          end
+          project.save
+          RUBY
+        env:
+          ESIPHER_APPLE_TEAM_ID: ${{ secrets.ESIPHER_APPLE_TEAM_ID }}
+          ESIPHER_IOS_PROFILE_NAME: ${{ secrets.ESIPHER_IOS_PROFILE_NAME }}
+
+      - name: Archive
+        working-directory: ios/App
+        # No signing settings on the command line — the App target now
+        # carries them, and only it should. The bundle id comes from
+        # capacitor.config.json's appId (set by `npx cap add ios`).
+        run: |
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            archive
+
+      - name: Export the .ipa
+        working-directory: ios/App
+        run: |
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportPath "$RUNNER_TEMP/ios-export" \
+            -exportOptionsPlist "$GITHUB_WORKSPACE/exportOptions.plist"
+
+      - name: Collect the .ipa
+        run: |
+          mkdir -p _out_ios
+          cp "$RUNNER_TEMP"/ios-export/*.ipa _out_ios/App.ipa
+          ls -la _out_ios
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esipher-app-ios
+          path: _out_ios
+          if-no-files-found: error
